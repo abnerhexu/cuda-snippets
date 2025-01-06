@@ -1,20 +1,28 @@
-#include <iostream>
 #include <cuda.h>
 #include "../utils/data.h"
 #include "../utils/timer.h"
+template<int BLOCK_SIZE>
+__global__ void shared_memory_mma(float *a, float *b, float *c, int M, int K, int N) {
+    int I = blockIdx.x * blockDim.x + threadIdx.x;
+    int J = blockIdx.y * blockDim.y + threadIdx.y;
+    int i = threadIdx.x;
+    int j = threadIdx.y;
 
-__global__ void simple_loop_mma(float* a, float* b, float* c, int M, int K, int N) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ float partialA[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ float partialB[BLOCK_SIZE][BLOCK_SIZE];
+    float psum = 0.0f;
 
-    if (row < M && col < N) {
-        float sum = 0.0f;
-        for (int k = 0; k < K; k++) {
-            sum += a[row * K + k] * b[k * N + col];
+    for (int k = 0; k < K; k += BLOCK_SIZE) {
+        // load data into shared memory
+        partialA[i][j] = (I < M && k + j < K) ? a[I * K + k + j] : 0.0f;
+        partialB[i][j] = (k + i < K && J < N) ? b[(k + i) * N + J] : 0.0f;
+        __syncthreads();
+        for (int l = 0; l < BLOCK_SIZE; l++) {
+            psum += partialA[i][l] * partialB[l][j];
         }
-        // 注意，在这里可能c矩阵同一个位置被写入多次，但是我们并不在乎，因为最终结果是一样的
-        // 原因在于可能有多个元素都满足row < M并且col < N
-        c[row * N + col] += sum;
+    }
+    if (I < M && J < N) {
+        c[I * N + J] += psum;
     }
 }
 
@@ -55,14 +63,15 @@ int main() {
     cudaMemcpy(d_c, cc.data(), M * N * sizeof(float), cudaMemcpyHostToDevice);
 
     // Call the GPU model
-    dim3 blockDim(32, 32, 1);
-    dim3 gridDim(32, 32, 1);
+    dim3 blocksPerGrid(64, 64, 1);
+    dim3 threadsPerBlock(16, 16, 1);
     CUDAProgTimer timer;
     timer.start();
     for (int i = 0; i < 1; i++)
-    simple_loop_mma<<<gridDim, blockDim>>>(d_a, d_b, d_c, M, K, N);
+    shared_memory_mma<16><<<blocksPerGrid, threadsPerBlock>>>(d_a, d_b, d_c, M, K, N);
     timer.stop();
     timer.info();
+
     // Copy the result back to the host
     cudaMemcpy(cc.data(), d_c, M * N * sizeof(float), cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
